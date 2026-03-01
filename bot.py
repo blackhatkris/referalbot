@@ -251,4 +251,4 @@ app.add_handler(CallbackQueryHandler(progress, pattern="progress"))
 app.add_handler(CallbackQueryHandler(claim, pattern="claim"))
 app.add_handler(ChatMemberHandler(track_join, ChatMemberHandler.CHAT_MEMBER))
 
-app.run_polling()
+app.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
