@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import urllib.parse
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -14,11 +15,10 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter
 
-# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REQUIRED_JOINS = 3
 
-# ================= DATABASE =================
+# ================= DB =================
 conn = sqlite3.connect("database.db", check_same_thread=False)
 cur = conn.cursor()
 
@@ -40,15 +40,13 @@ CREATE TABLE IF NOT EXISTS groups (
     reward_msg TEXT
 )
 """)
-
 conn.commit()
 
 # ================= HELPERS =================
 def get_user(group_id, user_id):
     cur.execute("""
     SELECT invite_link, join_count, completed, reward_claimed
-    FROM referrals
-    WHERE group_id=? AND user_id=?
+    FROM referrals WHERE group_id=? AND user_id=?
     """, (group_id, user_id))
     return cur.fetchone()
 
@@ -60,24 +58,9 @@ def save_user(group_id, user_id, invite_link):
     """, (group_id, user_id, invite_link))
     conn.commit()
 
-def increment_join(group_id, user_id):
+def inc_join(group_id, user_id):
     cur.execute("""
-    UPDATE referrals
-    SET join_count = join_count + 1
-    WHERE group_id=? AND user_id=?
-    """, (group_id, user_id))
-    conn.commit()
-
-def mark_completed(group_id, user_id):
-    cur.execute("""
-    UPDATE referrals SET completed=1
-    WHERE group_id=? AND user_id=?
-    """, (group_id, user_id))
-    conn.commit()
-
-def mark_claimed(group_id, user_id):
-    cur.execute("""
-    UPDATE referrals SET reward_claimed=1
+    UPDATE referrals SET join_count=join_count+1
     WHERE group_id=? AND user_id=?
     """, (group_id, user_id))
     conn.commit()
@@ -105,81 +88,79 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🔐 UNLOCK EXCLUSIVE ACCESS\n\n"
-        "Invite 3 friends using your personal invite link.\n"
-        "Invite link never expires.\n\n"
+        "Invite 3 friends using your personal link.\n"
         "👇 Start below 👇",
         reply_markup=keyboard
     )
 
-# ================= START REFERRAL =================
+# ================= START REF =================
 async def start_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
     group_id = query.message.chat.id
 
     data = get_user(group_id, user.id)
-    if data and data[0]:
-        await query.answer(
-            f"🔗 Your invite link:\n\n{data[0]}",
-            show_alert=True
-        )
-        return
 
-    try:
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=group_id,
-            name=f"ref_{user.id}"
-        )
-        save_user(group_id, user.id, invite.invite_link)
+    if not data or not data[0]:
+        try:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=group_id,
+                name=f"ref_{user.id}"
+            )
+            invite_link = invite.invite_link
+            save_user(group_id, user.id, invite_link)
+        except RetryAfter:
+            await query.answer(
+                "⚠️ Server busy hai\n5 minute baad try karo",
+                show_alert=True
+            )
+            return
+    else:
+        invite_link = data[0]
 
-        await query.answer(
-            f"✅ Invite link created:\n\n{invite.invite_link}",
-            show_alert=True
-        )
+    share_url = (
+        "https://t.me/share/url?"
+        + urllib.parse.urlencode({
+            "url": invite_link,
+            "text": "Join this group for exclusive channel 🔥"
+        })
+    )
 
-    except RetryAfter:
-        await query.answer(
-            "⚠️ Server busy hai\n5 minute baad try karo",
-            show_alert=True
-        )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
+        [InlineKeyboardButton("📊 My Progress", callback_data="progress")]
+    ])
+
+    await query.message.edit_reply_markup(reply_markup=keyboard)
+    await query.answer("✅ Share panel open karo", show_alert=False)
 
 # ================= TRACK JOINS =================
 async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.chat_member.chat
-    new_member = update.chat_member.new_chat_member
-
-    if not new_member or new_member.status not in ("member", "restricted"):
-        return
-
     invite = update.chat_member.invite_link
     if not invite:
         return
 
-    group_id = chat.id
+    group_id = update.chat_member.chat.id
 
     cur.execute("""
     SELECT user_id, join_count, completed
-    FROM referrals
-    WHERE group_id=? AND invite_link=?
+    FROM referrals WHERE group_id=? AND invite_link=?
     """, (group_id, invite.invite_link))
     row = cur.fetchone()
     if not row:
         return
 
-    referrer_id, join_count, completed = row
+    referrer_id, count, completed = row
     if completed:
         return
 
-    increment_join(group_id, referrer_id)
-
-    cur.execute("""
-    SELECT join_count FROM referrals
-    WHERE group_id=? AND user_id=?
-    """, (group_id, referrer_id))
-    new_count = cur.fetchone()[0]
-
-    if new_count >= REQUIRED_JOINS:
-        mark_completed(group_id, referrer_id)
+    inc_join(group_id, referrer_id)
+    if count + 1 >= REQUIRED_JOINS:
+        cur.execute("""
+        UPDATE referrals SET completed=1
+        WHERE group_id=? AND user_id=?
+        """, (group_id, referrer_id))
+        conn.commit()
 
 # ================= PROGRESS =================
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,13 +186,10 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🎁 Reward unlocked!", show_alert=True)
         return
 
-    text = f"{user.first_name} ✅\n{count}/{REQUIRED_JOINS} joined"
-    if completed:
-        text += "\n🎉 Completed"
-    if claimed:
-        text += "\n🎁 Reward claimed"
-
-    await query.answer(text, show_alert=True)
+    await query.answer(
+        f"{user.first_name}\n{count}/{REQUIRED_JOINS} joined",
+        show_alert=True
+    )
 
 # ================= CLAIM =================
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -224,18 +202,20 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Not eligible", show_alert=True)
         return
 
-    reward_msg = get_reward_msg(group_id)
-    mark_claimed(group_id, user.id)
+    cur.execute("""
+    UPDATE referrals SET reward_claimed=1
+    WHERE group_id=? AND user_id=?
+    """, (group_id, user.id))
+    conn.commit()
 
-    await query.message.reply_text(reward_msg)
+    await query.message.reply_text(get_reward_msg(group_id))
     await query.answer("🎉 Reward claimed!", show_alert=True)
 
 # ================= ADMIN =================
 async def setreward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return
-    group_id = update.effective_chat.id
-    set_reward_msg(group_id, " ".join(context.args))
+    set_reward_msg(update.effective_chat.id, " ".join(context.args))
     await update.message.reply_text("✅ Reward message updated")
 
 # ================= MAIN =================
