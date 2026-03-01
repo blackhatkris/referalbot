@@ -1,13 +1,19 @@
 import os
 import sqlite3
 import urllib.parse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    MessageHandler,
+    filters,
 )
 from telegram.error import RetryAfter
 
@@ -113,7 +119,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb
     )
 
-# ================= START REF =================
+# ================= START REFERRAL =================
 async def start_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     user = q.from_user
@@ -128,7 +134,6 @@ async def start_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             save_user(group_id, user.id, invite.invite_link)
             link = invite.invite_link
-            print("INVITE CREATED:", link)
         except RetryAfter:
             await q.answer("⚠️ Server busy, 5 min baad try karo", show_alert=True)
             return
@@ -148,17 +153,15 @@ async def start_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.edit_reply_markup(reply_markup=kb)
     await q.answer()
 
-# ================= TRACK JOIN (FIXED) =================
+# ================= TRACK JOINS =================
 async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.chat_member
 
-    # ONLY count when user becomes member
     if cm.new_chat_member.status != "member":
         return
 
     invite = cm.invite_link
     if not invite:
-        print("JOIN WITHOUT INVITE LINK")
         return
 
     group_id = cm.chat.id
@@ -171,7 +174,6 @@ async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = cur.fetchone()
 
     if not row:
-        print("INVITE LINK NOT FOUND IN DB")
         return
 
     referrer_id, count, completed = row
@@ -179,12 +181,10 @@ async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     inc_join(group_id, referrer_id)
-    print(f"JOIN COUNT UPDATED -> {referrer_id}: {count+1}")
 
     _, required = get_group(group_id)
     if count + 1 >= required:
         mark_completed(group_id, referrer_id)
-        print("REFERRAL COMPLETED:", referrer_id)
 
 # ================= PROGRESS =================
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,24 +200,18 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, count, completed, claimed = data
     _, required = get_group(group_id)
 
-    # 🔥 IMPORTANT FIX
     if completed and not claimed:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎁 Claim Reward", callback_data="claim")]
         ])
         await q.message.reply_text(
-            f"🎉 {user.first_name}, referral complete!\n\n"
-            f"{count}/{required} joined",
+            f"🎉 {user.first_name}, referral complete!\n\n{count}/{required} joined",
             reply_markup=kb
         )
         await q.answer("🎁 Reward unlocked!", show_alert=True)
         return
 
-    # Normal progress popup
-    await q.answer(
-        f"{count}/{required} joined",
-        show_alert=True
-    )
+    await q.answer(f"{count}/{required} joined", show_alert=True)
 
 # ================= CLAIM =================
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +226,7 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mark_claimed(group_id, user.id)
     reward, _ = get_group(group_id)
-    await q.message.reply_text(reward or "🎁 Reward unlocked! Admin will contact you.")
+    await q.message.reply_text(reward or "🎁 Reward unlocked!")
     await q.answer("🎉 Claimed", show_alert=True)
 
 # ================= ADMIN =================
@@ -249,15 +243,38 @@ async def setjoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_required_joins(update.effective_chat.id, int(context.args[0]))
     await update.message.reply_text("✅ Join count updated")
 
+# ================= DELETE JOIN / LEFT MSG ONLY =================
+async def delete_join_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    if msg.new_chat_members or msg.left_chat_member:
+        try:
+            await msg.delete()
+        except:
+            pass
+
 # ================= MAIN =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("panel", panel))
 app.add_handler(CommandHandler("setreward", setreward))
 app.add_handler(CommandHandler("setjoin", setjoin))
+
 app.add_handler(CallbackQueryHandler(start_ref, pattern="start_ref"))
 app.add_handler(CallbackQueryHandler(progress, pattern="progress"))
 app.add_handler(CallbackQueryHandler(claim, pattern="claim"))
+
 app.add_handler(ChatMemberHandler(track_join, ChatMemberHandler.CHAT_MEMBER))
 
+# 🔥 ONLY joined / left messages deleted
+app.add_handler(
+    MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER,
+        delete_join_left
+    )
+)
+
+# 🔑 VERY IMPORTANT
 app.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
