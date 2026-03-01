@@ -200,15 +200,24 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, count, completed, claimed = data
     _, required = get_group(group_id)
 
+    # 🔥 IMPORTANT FIX
     if completed and not claimed:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎁 Claim Reward", callback_data="claim")]
         ])
-        await q.message.reply_text("🎉 Referral complete!", reply_markup=kb)
-        await q.answer("🎁 Reward unlocked", show_alert=True)
+        await q.message.reply_text(
+            f"🎉 {user.first_name}, referral complete!\n\n"
+            f"{count}/{required} joined",
+            reply_markup=kb
+        )
+        await q.answer("🎁 Reward unlocked!", show_alert=True)
         return
 
-    await q.answer(f"{count}/{required} joined", show_alert=True)
+    # Normal progress popup
+    await q.answer(
+        f"{count}/{required} joined",
+        show_alert=True
+    )
 
 # ================= CLAIM =================
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
