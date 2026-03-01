@@ -16,9 +16,8 @@ from telegram.ext import (
 from telegram.error import RetryAfter
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-REQUIRED_JOINS = 3
 
-# ================= DB =================
+# ================= DATABASE =================
 conn = sqlite3.connect("database.db", check_same_thread=False)
 cur = conn.cursor()
 
@@ -37,12 +36,52 @@ CREATE TABLE IF NOT EXISTS referrals (
 cur.execute("""
 CREATE TABLE IF NOT EXISTS groups (
     group_id INTEGER PRIMARY KEY,
-    reward_msg TEXT
+    reward_msg TEXT,
+    required_joins INTEGER DEFAULT 3
 )
 """)
+
 conn.commit()
 
 # ================= HELPERS =================
+def get_group_settings(group_id):
+    cur.execute("""
+    SELECT reward_msg, required_joins
+    FROM groups WHERE group_id=?
+    """, (group_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("""
+        INSERT INTO groups (group_id)
+        VALUES (?)
+        """, (group_id,))
+        conn.commit()
+        return None, 3
+    return row[0], row[1]
+
+def set_required_joins(group_id, count):
+    cur.execute("""
+    INSERT INTO groups (group_id, required_joins)
+    VALUES (?, ?)
+    ON CONFLICT(group_id)
+    DO UPDATE SET required_joins=excluded.required_joins
+    """, (group_id, count))
+    conn.commit()
+
+def set_reward_msg(group_id, text):
+    cur.execute("""
+    INSERT INTO groups (group_id, reward_msg)
+    VALUES (?, ?)
+    ON CONFLICT(group_id)
+    DO UPDATE SET reward_msg=excluded.reward_msg
+    """, (group_id, text))
+    conn.commit()
+
+def get_reward_msg(group_id):
+    cur.execute("SELECT reward_msg FROM groups WHERE group_id=?", (group_id,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] else "🎁 Reward unlocked! Admin will contact you."
+
 def get_user(group_id, user_id):
     cur.execute("""
     SELECT invite_link, join_count, completed, reward_claimed
@@ -65,19 +104,19 @@ def inc_join(group_id, user_id):
     """, (group_id, user_id))
     conn.commit()
 
-def set_reward_msg(group_id, text):
+def mark_completed(group_id, user_id):
     cur.execute("""
-    INSERT INTO groups (group_id, reward_msg)
-    VALUES (?, ?)
-    ON CONFLICT(group_id)
-    DO UPDATE SET reward_msg=excluded.reward_msg
-    """, (group_id, text))
+    UPDATE referrals SET completed=1
+    WHERE group_id=? AND user_id=?
+    """, (group_id, user_id))
     conn.commit()
 
-def get_reward_msg(group_id):
-    cur.execute("SELECT reward_msg FROM groups WHERE group_id=?", (group_id,))
-    row = cur.fetchone()
-    return row[0] if row else "🎁 Reward unlocked! Admin will contact you."
+def mark_claimed(group_id, user_id):
+    cur.execute("""
+    UPDATE referrals SET reward_claimed=1
+    WHERE group_id=? AND user_id=?
+    """, (group_id, user_id))
+    conn.commit()
 
 # ================= PANEL =================
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,7 +127,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🔐 UNLOCK EXCLUSIVE ACCESS\n\n"
-        "Invite 3 friends using your personal link.\n"
+        "Invite friends using your personal link.\n"
         "👇 Start below 👇",
         reply_markup=keyboard
     )
@@ -132,7 +171,7 @@ async def start_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     await query.message.edit_reply_markup(reply_markup=keyboard)
-    await query.answer("✅ Share panel open karo", show_alert=False)
+    await query.answer()
 
 # ================= TRACK JOINS =================
 async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,6 +180,7 @@ async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     group_id = update.chat_member.chat.id
+    reward_msg, required_joins = get_group_settings(group_id)
 
     cur.execute("""
     SELECT user_id, join_count, completed
@@ -155,12 +195,9 @@ async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     inc_join(group_id, referrer_id)
-    if count + 1 >= REQUIRED_JOINS:
-        cur.execute("""
-        UPDATE referrals SET completed=1
-        WHERE group_id=? AND user_id=?
-        """, (group_id, referrer_id))
-        conn.commit()
+
+    if count + 1 >= required_joins:
+        mark_completed(group_id, referrer_id)
 
 # ================= PROGRESS =================
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,6 +210,7 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Referral not started", show_alert=True)
         return
 
+    reward_msg, required_joins = get_group_settings(group_id)
     _, count, completed, claimed = data
 
     if completed and not claimed:
@@ -187,7 +225,7 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer(
-        f"{user.first_name}\n{count}/{REQUIRED_JOINS} joined",
+        f"{user.first_name}\n{count}/{required_joins} joined",
         show_alert=True
     )
 
@@ -202,27 +240,36 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Not eligible", show_alert=True)
         return
 
-    cur.execute("""
-    UPDATE referrals SET reward_claimed=1
-    WHERE group_id=? AND user_id=?
-    """, (group_id, user.id))
-    conn.commit()
-
+    mark_claimed(group_id, user.id)
     await query.message.reply_text(get_reward_msg(group_id))
     await query.answer("🎉 Reward claimed!", show_alert=True)
 
-# ================= ADMIN =================
+# ================= ADMIN COMMANDS =================
 async def setreward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return
     set_reward_msg(update.effective_chat.id, " ".join(context.args))
     await update.message.reply_text("✅ Reward message updated")
 
+async def setjoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Usage: /setjoin 3")
+        return
+
+    count = int(context.args[0])
+    if count < 1:
+        await update.message.reply_text("❌ Join count must be ≥ 1")
+        return
+
+    set_required_joins(update.effective_chat.id, count)
+    await update.message.reply_text(f"✅ Required joins set to {count}")
+
 # ================= MAIN =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("panel", panel))
 app.add_handler(CommandHandler("setreward", setreward))
+app.add_handler(CommandHandler("setjoin", setjoin))
 app.add_handler(CallbackQueryHandler(start_ref, pattern="start_ref"))
 app.add_handler(CallbackQueryHandler(progress, pattern="progress"))
 app.add_handler(CallbackQueryHandler(claim, pattern="claim"))
